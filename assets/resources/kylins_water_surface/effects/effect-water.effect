@@ -1,0 +1,342 @@
+// Effect Syntax Guide: https://github.com/cocos-creator/docs-3d/blob/master/zh/material-system/effect-syntax.md
+
+CCEffect %{
+  techniques:
+  - name: opaque
+    passes:
+    - vert: unlit-vs:vert # builtin header
+      frag: unlit-fs:frag
+      properties: &props
+        tilingOffset:   { value: [1.0, 1.0, 0.0, 0.0] }
+        mainColor:      { value: [1.0, 1.0, 1.0, 1.0], target: albedo, editor: { displayName: Albedo, type: color } }
+        albedoScale:    { value: [1.0, 1.0, 1.0], target: albedoScaleAndCutoff.xyz }
+        alphaThreshold: { value: 0.5, target: albedoScaleAndCutoff.w, editor: { parent: USE_ALPHA_TEST } }
+        mainTexture:    { value: grey, target: albedoMap, editor: { displayName: AlbedoMap, parent: USE_ALBEDO_MAP } }
+
+        fresnelMin:           { value: 0.0, target: fresnelParam.x, editor: { slide: true, range: [0, 1.0], step: 0.001 } }
+        fresnelMax:           { value: 1.0, target: fresnelParam.y, editor: { slide: true, range: [0, 1.5], step: 0.001 } }
+        fresnelPower:         { value: 1.0, target: fresnelParam.z, editor: { slide: true, range: [0, 10.0], step: 0.001 } }
+        softEdgeDepth:        { value: 0.015, target: fresnelParam.w, editor: { slide: true, range: [0, 0.1], step: 0.0001 } }
+
+        reflectionMap:        { value: white }
+        refractionMap:        { value: white, editor: { parent: USE_REFRACTION_MAP } }
+
+        reflectionMaskMap:    { value: black, editor: { parent: USE_REFLECTION_MASK_MAP } }
+        noiseMap:   { value: black, editor: { parent: USE_NOISE_MAP } }
+        reflectionNoiseScale: { value: 0.2, target: reflNoiseParam.x, editor: { parent: USE_NOISE_MAP } }
+        reflectionNoiseMove:  { value: [0.2,0.2], target: reflNoiseParam.yz, editor: { parent: USE_NOISE_MAP } }
+        reflectionNoiseStrengthen:  { value: 0.02,  target: reflNoiseParam.w, editor: { parent: USE_NOISE_MAP } }
+
+        refractionNoiseScale: { value: 0.2, target: refrNoiseParam.x, editor: { parent: USE_NOISE_MAP } }
+        refractionNoiseMove:  { value: [0.2,0.2], target: refrNoiseParam.yz, editor: { parent: USE_NOISE_MAP } }
+        refractionNoiseStrengthen:  { value: 0.02,  target: refrNoiseParam.w, editor: { parent: USE_NOISE_MAP } }
+
+        bottomColor:            { value: [0, 0, 0], target: waterColorParam.xyz, editor: { type: color } }
+        depthPower:        { value: 2.0, target: waterColorParam.w, editor: { slide: true, range: [0, 0.1], step: 0.0001 } }
+}%
+
+CCProgram shared-ubos %{
+  uniform Constants {
+    vec4 tilingOffset;
+    vec4 albedo;
+    vec4 albedoScaleAndCutoff;
+
+    vec4 backColor;
+    vec4 fresnelParam;
+    vec4 reflNoiseParam;
+    vec4 refrNoiseParam;
+
+    vec4 waterColorParam;
+  };
+}%
+
+CCProgram unlit-vs %{  
+  precision highp float;
+  #include <legacy/input-standard>
+  #include <builtin/uniforms/cc-global>
+  #include <legacy/decode-base>
+  #include <legacy/local-batch>
+  #include <legacy/input-standard>
+  #include <legacy/fog-vs>
+  #include <legacy/shadow-map-vs>
+  #include <shared-ubos>
+
+  in vec4 a_color;
+  #if HAS_SECOND_UV
+    in vec2 a_texCoord1;
+  #endif
+
+  out vec3 v_position;
+  out vec3 v_normal;
+  out vec3 v_tangent;
+  out vec3 v_bitangent;
+  out vec2 v_uv;
+  out vec2 v_uv1;
+  out vec4 v_color;
+  out vec4 v_screenPos;
+  out vec4 v_bufferParams;
+
+  vec4 vert () {
+    StandardVertInput In;
+    CCVertInput(In);
+
+    mat4 matWorld, matWorldIT;
+    CCGetWorldMatrixFull(matWorld, matWorldIT);
+
+    vec4 pos = matWorld * In.position;
+
+    v_position = pos.xyz;
+    v_normal = normalize((matWorldIT * vec4(In.normal, 0.0)).xyz);
+    v_tangent = normalize((matWorld * vec4(In.tangent.xyz, 0.0)).xyz);
+    v_bitangent = cross(v_normal, v_tangent) * In.tangent.w; // note the cross order
+
+    v_uv = a_texCoord * tilingOffset.xy + tilingOffset.zw;
+    #if HAS_SECOND_UV
+      v_uv1 = a_texCoord1;
+    #endif
+    
+    #if SAMPLE_FROM_RT
+      CC_HANDLE_RT_SAMPLE_FLIP(v_uv);
+    #endif
+    #if HAS_SECOND_UV
+      v_uv1 = a_texCoord1 * tilingOffset.xy + tilingOffset.zw;
+      #if SAMPLE_FROM_RT
+        CC_HANDLE_RT_SAMPLE_FLIP(v_uv1);
+      #endif
+    #endif
+
+    v_color = a_color;
+
+    CC_TRANSFER_FOG(pos);
+    CC_TRANSFER_SHADOW(pos);
+
+    float near = cc_nearFar.x;
+    float far = cc_nearFar.y;
+    float zc0 = (near - far)/(near); // equals to 1 - far/near
+    float zc1 = far/near;
+    v_bufferParams = vec4(zc0, zc1, zc0/far, zc1/far);
+
+    v_screenPos = cc_matProj * (cc_matView * matWorld) * In.position;
+    return v_screenPos;
+  }
+}%
+
+CCProgram unlit-fs %{
+  precision highp float;
+  #include <legacy/output>
+  #include <legacy/fog-fs>
+  #include <legacy/shadow-map-fs>
+  #include <builtin/uniforms/cc-environment>
+  #include <shared-ubos>
+  #include <special-render-flag>
+
+  in vec2 v_uv;
+  in vec3 v_position;
+  in vec3 v_normal;
+  in vec4 v_color;
+  in vec4 v_screenPos;
+  in vec4 v_bufferParams;
+
+  uniform sampler2D albedoMap;
+  
+  uniform sampler2D reflectionMap;
+  #if USE_REFLECTION_MASK_MAP
+    uniform sampler2D reflectionMaskMap;
+  #endif
+  #if USE_NOISE_MAP
+    uniform sampler2D noiseMap;
+  #endif
+
+  #if USE_REFRACTION_MAP
+    uniform sampler2D refractionMap;
+  #endif
+
+  #if USE_DEPTH_MAP
+    uniform sampler2D depthMap;
+    #include <common/data/packing>
+  #endif
+
+  uniform Constant {
+    vec4 mainColor;
+  };
+
+  vec4 frag () {
+    
+    vec3 V = normalize(v_position.xyz - cc_cameraPos.xyz);
+    vec3 N = normalize(v_normal);
+    float NV = dot(N,-V); 
+    float fresnel = 1.0 - NV;
+
+    vec4 baseColor = mainColor;
+    #if USE_VERTEX_COLOR
+      baseColor.rgb *= v_color.rgb; // use linear
+      baseColor.a *= v_color.a;
+    #endif
+
+    #if USE_ALBEDO_MAP
+      baseColor *=  texture(albedoMap, v_uv);
+    #endif
+
+    baseColor.rgb *= albedoScaleAndCutoff.xyz;
+
+    vec4 col = vec4(1.0,1.0,1.0,1.0);
+
+    fresnel = fresnelParam.x + (fresnelParam.y - fresnelParam.x) * pow(fresnel,fresnelParam.z);
+
+    #if USE_REFLECTION_MASK_MAP
+      fresnel *= texture(reflectionMaskMap, v_uv).r;
+    #endif
+
+
+    vec2 screenUV = v_screenPos.xy / v_screenPos.w * 0.5 + 0.5;
+    
+    float reflOffset = 0.0;
+    vec2 noiseUV;
+    #if USE_NOISE_MAP
+      float reflNoiseScale = reflNoiseParam.x;
+      vec2 reflNoiseMove = reflNoiseParam.yz;
+      float reflNoiseStrengthen = reflNoiseParam.w;
+      noiseUV = v_position.xz * reflNoiseScale + cc_time.xx * reflNoiseMove;
+      reflOffset = texture(noiseMap, noiseUV).r;
+      reflOffset = reflOffset * 2.0 - 1.0;
+      reflOffset *= reflNoiseStrengthen;
+    #endif
+
+    float depthOffset = 1.0;
+    float diffDepth = 1.0;
+    #if USE_REFRACTION_MAP
+      float refrOffset = 0.0;
+      #if USE_NOISE_MAP
+        float refrNoiseScale = refrNoiseParam.x;
+        vec2 refrNoiseMove = refrNoiseParam.yz;
+        float refrNoiseStrengthen = refrNoiseParam.w;
+        noiseUV = v_position.xz * refrNoiseScale + cc_time.xx * refrNoiseMove;
+        refrOffset = texture(noiseMap, noiseUV).r;
+        refrOffset = refrOffset * 2.0 - 1.0;
+        refrOffset *= refrNoiseStrengthen;
+      #endif
+
+      vec4 refractionInfo = texture(refractionMap,screenUV + refrOffset);
+      baseColor.rgb *= refractionInfo.rgb;
+
+      diffDepth = refractionInfo.a;
+      baseColor.rgb = mix(baseColor.rgb,waterColorParam.rgb,pow(diffDepth,waterColorParam.w));
+
+    #endif
+
+    float threshold = fresnelParam.w;
+    if(diffDepth <= threshold){
+      fresnel *= diffDepth / threshold;
+    } 
+
+    col = texture(reflectionMap, vec2(1.0 - screenUV.x, screenUV.y) + reflOffset * diffDepth);
+    baseColor.rgb = mix(baseColor.rgb,col.rgb,fresnel);
+
+    vec3 L = normalize(-cc_mainLitDir.xyz);
+    float NL = 0.5 * dot(N, L) + 0.5;
+
+    float shadow = 1.0;
+    #if CC_RECEIVE_SHADOW
+      NL = max(dot(N, L), 0.0);
+      if (NL > 0.0) {
+        shadow = CCShadowFactorBase(CC_SHADOW_POSITION, N, vec2(0.0, 0.0));
+      }
+    #endif
+
+    vec3 finalColor = NL * cc_mainLitColor.rgb * cc_mainLitColor.w * shadow;
+    //baseColor.rgb *= finalColor;
+
+    CC_APPLY_FOG(baseColor, v_position);
+    return CCFragOutput(baseColor);
+
+  }
+}%
+
+CCProgram shadow-caster-vs %{
+  precision highp float;
+  #include <legacy/input-standard>
+  #include <legacy/decode-base>
+  #include <legacy/local-batch>
+  #include <shared-ubos>
+  #include <builtin/uniforms/cc-shadow>
+#if CC_SUPPORT_CASCADED_SHADOW_MAP
+  #include <builtin/uniforms/cc-csm>
+#endif
+
+  #if HAS_SECOND_UV || CC_USE_LIGHTMAP
+    in vec2 a_texCoord1;
+  #endif
+
+  out vec2 v_uv;
+  out vec2 v_uv1;
+  out vec4 v_worldPos;
+
+  out float v_clip_depth;
+
+  vec4 vert () {
+    StandardVertInput In;
+    CCVertInput(In);
+
+    mat4 matWorld, matWorldIT;
+    CCGetWorldMatrixFull(matWorld, matWorldIT);
+
+    v_worldPos = matWorld * In.position;
+    vec4 clipPos = cc_matLightViewProj * v_worldPos;
+
+    v_uv = a_texCoord * tilingOffset.xy + tilingOffset.zw;
+    #if HAS_SECOND_UV
+      v_uv1 = a_texCoord1 * tilingOffset.xy + tilingOffset.zw;
+    #endif
+
+    v_clip_depth = clipPos.z / clipPos.w * 0.5 + 0.5;
+
+    return clipPos;
+  }
+}%
+
+CCProgram shadow-caster-fs %{
+  precision highp float;
+  #include <shared-ubos>
+  #include <common/data/packing>
+  #include <legacy/shadow-map-base>
+
+  in vec2 v_uv;
+  in vec2 v_uv1;
+  in vec4 v_worldPos;
+  in float v_clip_depth;
+
+  #if USE_ALBEDO_MAP
+    uniform sampler2D albedoMap;
+    #pragma define-meta ALBEDO_UV options([v_uv, v_uv1])
+  #endif
+
+  #if USE_ALPHA_TEST
+    #pragma define-meta ALPHA_TEST_CHANNEL options([a, r])
+  #endif
+
+  vec4 frag () {
+    vec4 baseColor = albedo;
+
+    #if USE_ALBEDO_MAP
+      baseColor *= texture(albedoMap, ALBEDO_UV);
+    #endif
+
+    #if USE_ALPHA_TEST
+      if (baseColor.ALPHA_TEST_CHANNEL < albedoScaleAndCutoff.w) discard;
+    #endif
+
+    // spot use linear
+    if(cc_shadowLPNNInfo.x > 0.000001 && cc_shadowLPNNInfo.x < 1.999999) {
+      // enabled linear depth
+      if (cc_shadowNFLSInfo.z > 0.000001) {
+        return vec4(CCGetLinearDepth(v_worldPos.xyz), 1.0, 1.0, 1.0);
+      }
+    }
+
+    if (cc_shadowLPNNInfo.y > 0.000001) {
+      return packDepthToRGBA(v_clip_depth);
+    }
+
+    return vec4(v_clip_depth, 1.0, 1.0, 1.0);
+  }
+}%
